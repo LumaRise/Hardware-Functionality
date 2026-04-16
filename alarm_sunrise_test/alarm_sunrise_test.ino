@@ -1,142 +1,146 @@
-/*
-  Serial Monitor commands:
-    start   -> manually start sunrise
-    stop    -> stop sunrise and turn LEDs off
-    status  -> print current values
-    0 / 1 / 2 -> change pattern
-*/
-
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
 #include <FastLED.h>
+
+/* =====================================================
+   LumaRise Student Pattern + Sound Test
+   -----------------------------------------------------
+   Students can:
+   - choose a pattern
+   - choose a color combo
+   - type "play" to test sunrise + sound
+   - use button: short press = snooze, long press = stop
+
+   SERIAL COMMANDS:
+   play           -> start sunrise
+   stop           -> stop everything
+   0 / 1 / 2      -> choose pattern
+   c0 / c1 / c2 / c3 / c4 -> choose color combo
+   help           -> show commands
+   ===================================================== */
 
 /* ================= LED SETUP ================= */
 #define LED_PIN       5
 #define NUM_LEDS      64
 #define LED_TYPE      WS2812B
 #define COLOR_ORDER   GRB
+#define BRIGHTNESS    50
 
 CRGB leds[NUM_LEDS];
 
-/* ================= CUSTOMIZABLE SETTINGS =================
-  mainly edit this section only
-===================================================== */
+/* ================= DFPLAYER SETUP ================= */
+SoftwareSerial mySoftwareSerial(6, 7); // RX, TX
+DFRobotDFPlayerMini myDFPlayer;
 
+/* ================= BUTTON SETUP ================= */
+#define BUTTON_PIN 2
+
+/* ================= TIMING ================= */
+const unsigned long sunriseDuration = 20000; // 20 sec for testing
+const unsigned long longPressMs     = 900;
+const unsigned long debounceMs      = 40;
+const unsigned long snoozeMs        = 10000; // 10 sec test snooze
+
+/* ================= STUDENT SETTINGS ================= */
 // Pattern choices:
 // 0 = Full Glow
-// 1 = Bottom-Up
+// 1 = Bottom Up
 // 2 = Center Expand
 int patternId = 0;
 
-// Sunrise color combo
-CRGB startColor = CRGB(20, 0, 0);        // dark red
-CRGB midColor   = CRGB(255, 100, 0);     // orange
-CRGB endColor   = CRGB(255, 255, 220);   // warm white
+// Color combo choices:
+// 0 = Classic Sunrise
+// 1 = Soft Golden Morning
+// 2 = Deep Sunset to Sunrise
+// 3 = Pink Sunrise
+// 4 = Peach Sky
+int colorComboId = 0;
 
-// Brightness range
+// Brightness scaling inside the sunrise effect
 uint8_t minBrightness = 35;
 uint8_t maxBrightness = 255;
 
-// Optional safety cap for the whole matrix
-uint8_t globalBrightnessCap = 50;
+/* ================= STATE ================= */
+bool isPlaying = false;
+bool sunriseComplete = false;
+bool isSnoozing = false;
 
-/* ==================================================== */
+unsigned long sunriseStartTime = 0;
+unsigned long snoozeStartTime = 0;
 
-/* ================= ALARM SETTINGS ================= */
-int sunriseOffsetSec   = 60;
-int sunriseDurationSec = 60;
+/* ================= BUTTON TRACKING ================= */
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
 
-/* ================= SYSTEM STATE ================= */
-enum AlarmState {
-  IDLE,
-  SUNRISE,
-  ALARM
-};
+bool pressInProgress = false;
+unsigned long pressStartTime = 0;
 
-AlarmState currentState = IDLE;
+/* ================= COLOR VARIABLES ================= */
+CRGB startColor;
+CRGB midColor;
+CRGB endColor;
 
-bool sunriseRunning = false;
-bool alarmTriggered = false;
-unsigned long sunriseStartMs = 0;
-
-/* ================= TIME DATA FROM ESP32 ================= */
-int currentHour = 0;
-int currentMinute = 0;
-int currentSecond = 0;
-
-int alarmHour = 7;
-int alarmMinute = 0;
-int alarmSecond = 0;
-
-/* ================= STATUS TIMER ================= */
-unsigned long lastStatusSendMs = 0;
-const unsigned long STATUS_SEND_INTERVAL = 1000;
-
-/* ================= XY HELPER =================
-   Converts (x, y) to index for zig-zag wired 8x8 matrix
-*/
+/* =====================================================
+   XY HELPER
+   Converts (x, y) to LED index for zig-zag wiring
+   ===================================================== */
 int xy(int x, int y) {
   if (y % 2 == 0) return y * 8 + x;
-  return y * 8 + (7 - x);
+  else            return y * 8 + (7 - x);
 }
 
-/* ================= TIME HELPERS ================= */
+/* =====================================================
+   COLOR COMBOS
+   ===================================================== */
+void setColorCombo(int comboId) {
+  colorComboId = comboId;
 
-bool parseTime12(const String& input, int &h, int &m, int &s) {
-  String t = input;
-  t.trim();
+  switch (colorComboId) {
+    case 0: // Classic Sunrise
+      startColor = CRGB(20, 0, 0);
+      midColor   = CRGB(255, 100, 0);
+      endColor   = CRGB(255, 255, 220);
+      break;
 
-  int sp = t.lastIndexOf(' ');
-  if (sp < 0) return false;
+    case 1: // Soft Golden Morning
+      startColor = CRGB(40, 10, 0);
+      midColor   = CRGB(255, 140, 20);
+      endColor   = CRGB(255, 240, 180);
+      break;
 
-  String timePart = t.substring(0, sp);
-  String ampm = t.substring(sp + 1);
-  ampm.toUpperCase();
+    case 2: // Deep Sunset to Sunrise
+      startColor = CRGB(60, 0, 20);
+      midColor   = CRGB(255, 80, 0);
+      endColor   = CRGB(255, 220, 170);
+      break;
 
-  int c1 = timePart.indexOf(':');
-  int c2 = timePart.indexOf(':', c1 + 1);
+    case 3: // Pink Sunrise
+      startColor = CRGB(35, 0, 15);
+      midColor   = CRGB(255, 90, 120);
+      endColor   = CRGB(255, 220, 210);
+      break;
 
-  if (c1 < 0 || c2 < 0) return false;
+    case 4: // Peach Sky
+      startColor = CRGB(25, 5, 0);
+      midColor   = CRGB(255, 120, 60);
+      endColor   = CRGB(255, 230, 190);
+      break;
 
-  int hh = timePart.substring(0, c1).toInt();
-  int mm = timePart.substring(c1 + 1, c2).toInt();
-  int ss = timePart.substring(c2 + 1).toInt();
-
-  if (hh < 1 || hh > 12 || mm < 0 || mm > 59 || ss < 0 || ss > 59) return false;
-
-  if (ampm == "AM") {
-    if (hh == 12) hh = 0;
-  } else if (ampm == "PM") {
-    if (hh != 12) hh += 12;
-  } else {
-    return false;
+    default:
+      startColor = CRGB(20, 0, 0);
+      midColor   = CRGB(255, 100, 0);
+      endColor   = CRGB(255, 255, 220);
+      colorComboId = 0;
+      break;
   }
-
-  h = hh;
-  m = mm;
-  s = ss;
-  return true;
 }
 
-long secondsSinceMidnight(int h, int m, int s) {
-  return (long)h * 3600L + (long)m * 60L + s;
-}
-
-long secondsUntilEvent(long nowSec, long targetSec) {
-  long diff = targetSec - nowSec;
-  if (diff < 0) diff += 86400L;  // wrap to next day
-  return diff;
-}
-
-String stateToString(AlarmState st) {
-  if (st == IDLE) return "IDLE";
-  if (st == SUNRISE) return "SUNRISE";
-  if (st == ALARM) return "ALARM";
-  return "IDLE";
-}
-
-/* ================= COLOR BLENDING =================
-   Uses p (0.0 to 1.0) to blend:
-   start -> mid -> end
-*/
+/* =====================================================
+   SUNRISE COLOR BLENDING
+   p = 0.0 -> start
+   p = 1.0 -> end
+   ===================================================== */
 CRGB getSunriseColor(float p) {
   p = constrain(p, 0.0f, 1.0f);
 
@@ -154,26 +158,26 @@ CRGB getSunriseColor(float p) {
     c.b = midColor.b + (endColor.b - midColor.b) * t;
   }
 
-  uint8_t scaledBrightness = map((int)(p * 100.0f), 0, 100, minBrightness, maxBrightness);
+  uint8_t scaledBrightness = map((int)(p * 100), 0, 100, minBrightness, maxBrightness);
   c.nscale8_video(scaledBrightness);
 
   return c;
 }
 
-/* ================= PATTERN 0: FULL GLOW ================= */
+/* =====================================================
+   PATTERNS
+   ===================================================== */
 void showSunriseFullGlow(float p) {
   CRGB c = getSunriseColor(p);
   fill_solid(leds, NUM_LEDS, c);
   FastLED.show();
 }
 
-/* ================= PATTERN 1: BOTTOM-UP ================= */
 void showSunriseBottomUp(float p) {
   CRGB c = getSunriseColor(p);
   FastLED.clear();
 
   int rowsLit = round(p * 8.0f);
-  rowsLit = constrain(rowsLit, 0, 8);
 
   for (int y = 7; y >= 8 - rowsLit; y--) {
     for (int x = 0; x < 8; x++) {
@@ -184,14 +188,14 @@ void showSunriseBottomUp(float p) {
   FastLED.show();
 }
 
-/* ================= PATTERN 2: CENTER EXPAND ================= */
 void showSunriseCenterExpand(float p) {
   p = constrain(p, 0.0f, 1.0f);
   CRGB c = getSunriseColor(p);
+
   FastLED.clear();
 
   int stage = floor(p * 4.0f);
-  stage = constrain(stage, 0, 4);
+  if (stage > 3) stage = 3;
 
   for (int y = 0; y < 8; y++) {
     for (int x = 0; x < 8; x++) {
@@ -208,202 +212,232 @@ void showSunriseCenterExpand(float p) {
   FastLED.show();
 }
 
-/* ================= PATTERN SWITCH ================= */
 void showSunrise(float p) {
   if (patternId == 0) {
     showSunriseFullGlow(p);
-  } else if (patternId == 1) {
+  }
+  else if (patternId == 1) {
     showSunriseBottomUp(p);
-  } else if (patternId == 2) {
+  }
+  else if (patternId == 2) {
     showSunriseCenterExpand(p);
-  } else {
+  }
+  else {
     showSunriseFullGlow(p);
   }
 }
 
-/* ================= LED CONTROL ================= */
-void clearLeds() {
+/* =====================================================
+   SYSTEM HELPERS
+   ===================================================== */
+void stopEverything() {
+  isPlaying = false;
+  sunriseComplete = false;
+  isSnoozing = false;
+
+  myDFPlayer.stop();
+  FastLED.clear();
+  FastLED.show();
+
+  Serial.println("STOP: LEDs + sound OFF.");
+}
+
+void startSunrise() {
+  Serial.println("Starting sunrise simulation...");
+  isPlaying = true;
+  sunriseComplete = false;
+  isSnoozing = false;
+  sunriseStartTime = millis();
+}
+
+void startSnooze() {
+  if (!isPlaying) return;
+
+  Serial.println("SNOOZE: LEDs + sound OFF temporarily.");
+  isSnoozing = true;
+  snoozeStartTime = millis();
+
+  myDFPlayer.stop();
   FastLED.clear();
   FastLED.show();
 }
 
-void showAlarmState() {
+void endSnoozeAndResumeAlarm() {
+  Serial.println("SNOOZE END: Resuming alarm.");
+  isSnoozing = false;
+
   fill_solid(leds, NUM_LEDS, endColor);
   FastLED.show();
+
+  myDFPlayer.loop(1);
+  sunriseComplete = true;
 }
 
-/* ================= SERIAL FROM ESP32 ================= */
-void handleSerial1FromESP32() {
-  while (Serial1.available()) {
-    String line = Serial1.readStringUntil('\n');
-    line.trim();
+/* =====================================================
+   BUTTON
+   Short press = snooze
+   Long press = stop
+   ===================================================== */
+void updateButton() {
+  bool reading = digitalRead(BUTTON_PIN);
 
-    if (line.startsWith("TIME,")) {
-      String value = line.substring(5);
-      parseTime12(value, currentHour, currentMinute, currentSecond);
-    }
-    else if (line.startsWith("ALARM,")) {
-      String value = line.substring(6);
-      parseTime12(value, alarmHour, alarmMinute, alarmSecond);
-    }
-    else if (line.startsWith("SUNCFG,")) {
-      int c1 = line.indexOf(',');
-      int c2 = line.indexOf(',', c1 + 1);
+  if (reading != lastButtonReading) {
+    lastDebounceTime = millis();
+    lastButtonReading = reading;
+  }
 
-      if (c1 > 0 && c2 > c1) {
-        sunriseOffsetSec = line.substring(c1 + 1, c2).toInt();
-        sunriseDurationSec = line.substring(c2 + 1).toInt();
+  if (millis() - lastDebounceTime > debounceMs) {
+    if (reading != stableButtonState) {
+      stableButtonState = reading;
 
-        sunriseOffsetSec = constrain(sunriseOffsetSec, 0, 3600);
-        sunriseDurationSec = constrain(sunriseDurationSec, 1, 7200);
+      if (stableButtonState == LOW) {
+        pressInProgress = true;
+        pressStartTime = millis();
+      }
+
+      if (stableButtonState == HIGH && pressInProgress) {
+        pressInProgress = false;
+        unsigned long pressDuration = millis() - pressStartTime;
+
+        if (isPlaying) {
+          if (pressDuration >= longPressMs) {
+            stopEverything();
+          } else {
+            startSnooze();
+          }
+        }
       }
     }
   }
 }
 
-/* ================= SERIAL MONITOR COMMANDS ================= */
-void printStatus() {
-  Serial.println("----- STATUS -----");
-  Serial.print("Current Time: ");
-  Serial.print(currentHour); Serial.print(":");
-  Serial.print(currentMinute); Serial.print(":");
-  Serial.println(currentSecond);
-
-  Serial.print("Alarm Time: ");
-  Serial.print(alarmHour); Serial.print(":");
-  Serial.print(alarmMinute); Serial.print(":");
-  Serial.println(alarmSecond);
-
-  Serial.print("Pattern: ");
-  Serial.println(patternId);
-
-  Serial.print("Offset Sec: ");
-  Serial.println(sunriseOffsetSec);
-
-  Serial.print("Duration Sec: ");
-  Serial.println(sunriseDurationSec);
-
-  Serial.print("State: ");
-  Serial.println(stateToString(currentState));
-  Serial.println("------------------");
+/* =====================================================
+   SERIAL COMMANDS
+   ===================================================== */
+void printMenu() {
+  Serial.println();
+  Serial.println("===== LumaRise Test Commands =====");
+  Serial.println("play   -> start sunrise");
+  Serial.println("stop   -> stop LEDs + sound");
+  Serial.println("0      -> Full Glow pattern");
+  Serial.println("1      -> Bottom Up pattern");
+  Serial.println("2      -> Center Expand pattern");
+  Serial.println("c0     -> Classic Sunrise");
+  Serial.println("c1     -> Soft Golden Morning");
+  Serial.println("c2     -> Deep Sunset to Sunrise");
+  Serial.println("c3     -> Pink Sunrise");
+  Serial.println("c4     -> Peach Sky");
+  Serial.println("help   -> show this menu");
+  Serial.println("==================================");
+  Serial.println();
 }
 
-void handleUsbSerialCommands() {
+void handleSerial() {
   if (!Serial.available()) return;
 
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();
-  cmd.toLowerCase();
+  String command = Serial.readStringUntil('\n');
+  command.trim();
+  command.toLowerCase();
 
-  if (cmd == "start") {
-    sunriseRunning = true;
-    alarmTriggered = false;
-    sunriseStartMs = millis();
-    currentState = SUNRISE;
-    Serial.println("Manual sunrise started.");
+  if (command == "play") {
+    if (!isPlaying) {
+      startSunrise();
+    } else {
+      Serial.println("Sunrise already running.");
+    }
   }
-  else if (cmd == "stop") {
-    sunriseRunning = false;
-    alarmTriggered = false;
-    currentState = IDLE;
-    clearLeds();
-    Serial.println("Stopped.");
+  else if (command == "stop") {
+    if (isPlaying) stopEverything();
+    else Serial.println("System already stopped.");
   }
-  else if (cmd == "status") {
-    printStatus();
-  }
-  else if (cmd == "0" || cmd == "1" || cmd == "2") {
-    patternId = cmd.toInt();
+  else if (command == "0" || command == "1" || command == "2") {
+    patternId = command.toInt();
     Serial.print("Pattern set to: ");
     Serial.println(patternId);
   }
+  else if (command == "c0") {
+    setColorCombo(0);
+    Serial.println("Color combo set to: Classic Sunrise");
+  }
+  else if (command == "c1") {
+    setColorCombo(1);
+    Serial.println("Color combo set to: Soft Golden Morning");
+  }
+  else if (command == "c2") {
+    setColorCombo(2);
+    Serial.println("Color combo set to: Deep Sunset to Sunrise");
+  }
+  else if (command == "c3") {
+    setColorCombo(3);
+    Serial.println("Color combo set to: Pink Sunrise");
+  }
+  else if (command == "c4") {
+    setColorCombo(4);
+    Serial.println("Color combo set to: Peach Sky");
+  }
+  else if (command == "help") {
+    printMenu();
+  }
+  else {
+    Serial.println("Unknown command. Type 'help' for options.");
+  }
 }
 
-/* ================= STATE MACHINE ================= */
-void updateAlarmLogic() {
-  long nowSec = secondsSinceMidnight(currentHour, currentMinute, currentSecond);
-  long alarmSec = secondsSinceMidnight(alarmHour, alarmMinute, alarmSecond);
+/* =====================================================
+   SETUP
+   ===================================================== */
+void setup() {
+  Serial.begin(9600);
 
-  long sunriseStartSec = alarmSec - sunriseOffsetSec;
-  while (sunriseStartSec < 0) sunriseStartSec += 86400L;
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  long untilAlarm = secondsUntilEvent(nowSec, alarmSec);
-  long untilSunrise = secondsUntilEvent(nowSec, sunriseStartSec);
-
-  if (!sunriseRunning && !alarmTriggered) {
-    if (untilSunrise == 0) {
-      sunriseRunning = true;
-      sunriseStartMs = millis();
-      currentState = SUNRISE;
-      Serial.println("Auto sunrise started.");
-    }
+  mySoftwareSerial.begin(9600);
+  if (!myDFPlayer.begin(mySoftwareSerial)) {
+    Serial.println("Unable to begin DFPlayer Mini.");
+    while (true);
   }
 
-  if (sunriseRunning) {
-    float elapsed = (millis() - sunriseStartMs) / 1000.0f;
-    float p = elapsed / sunriseDurationSec;
+  myDFPlayer.volume(25);
+
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.clear();
+  FastLED.show();
+
+  setColorCombo(0);
+
+  Serial.println("LumaRise Student Test Ready!");
+  printMenu();
+}
+
+/* =====================================================
+   LOOP
+   ===================================================== */
+void loop() {
+  updateButton();
+  handleSerial();
+
+  if (isSnoozing) {
+    if (millis() - snoozeStartTime >= snoozeMs) {
+      endSnoozeAndResumeAlarm();
+    }
+    return;
+  }
+
+  if (isPlaying && !sunriseComplete) {
+    unsigned long elapsed = millis() - sunriseStartTime;
+    float p = (float)elapsed / sunriseDuration;
 
     if (p >= 1.0f) {
       p = 1.0f;
       showSunrise(p);
+
+      myDFPlayer.loop(1);
+      sunriseComplete = true;
+
+      Serial.println("ALARM: Sound started. Short press=snooze, long press=stop.");
     } else {
       showSunrise(p);
     }
-
-    if (untilAlarm == 0) {
-      sunriseRunning = false;
-      alarmTriggered = true;
-      currentState = ALARM;
-      Serial.println("Alarm triggered.");
-    }
   }
-
-  if (alarmTriggered) {
-    showAlarmState();
-  }
-
-  if (!sunriseRunning && !alarmTriggered) {
-    currentState = IDLE;
-  }
-}
-
-/* ================= STATUS BACK TO ESP32 ================= */
-void sendStatusToESP32() {
-  if (millis() - lastStatusSendMs < STATUS_SEND_INTERVAL) return;
-  lastStatusSendMs = millis();
-
-  long nowSec = secondsSinceMidnight(currentHour, currentMinute, currentSecond);
-  long alarmSec = secondsSinceMidnight(alarmHour, alarmMinute, alarmSecond);
-  long countdown = 0;
-
-  if (currentState == SUNRISE || currentState == ALARM) {
-    countdown = secondsUntilEvent(nowSec, alarmSec);
-  }
-
-  Serial1.print("STATUS,");
-  Serial1.print(stateToString(currentState));
-  Serial1.print(",");
-  Serial1.println(countdown);
-}
-
-/* ================= SETUP ================= */
-void setup() {
-  Serial.begin(115200);
-  Serial1.begin(9600);
-
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
-  FastLED.setBrightness(globalBrightnessCap);
-
-  clearLeds();
-
-  Serial.println("LumaRise Arduino ready.");
-  Serial.println("Commands: start, stop, status, 0, 1, 2");
-}
-
-/* ================= LOOP ================= */
-void loop() {
-  handleSerial1FromESP32();
-  handleUsbSerialCommands();
-  updateAlarmLogic();
-  sendStatusToESP32();
 }
