@@ -202,7 +202,7 @@ void handleSerial() {
 
 /* ================= SETUP ================= */
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
 
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
 
