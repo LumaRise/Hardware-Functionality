@@ -241,23 +241,23 @@ int xy(int x, int y) {
 
 void getThemeColors(int theme, CRGB &startColor, CRGB &midColor, CRGB &endColor) {
   switch (theme) {
-    case 1:
+    case 1: // soft golden morning
       startColor = CRGB(40, 10, 0);
       midColor   = CRGB(255, 140, 20);
       endColor   = CRGB(255, 240, 180);
       break;
-    case 2:
+    case 2: // deep sunset to sunrise
       startColor = CRGB(60, 0, 20);
       midColor   = CRGB(255, 80, 0);
       endColor   = CRGB(255, 220, 160);
       break;
-    case 3:
+    case 3: //pink sunrise
       startColor = CRGB(30, 0, 10);
       midColor   = CRGB(255, 80, 150);
       endColor   = CRGB(255, 220, 240);
       break;
     case 0:
-    default:
+    default: // classic sunrise
       startColor = CRGB(20, 0, 0);
       midColor   = CRGB(255, 100, 0);
       endColor   = CRGB(255, 255, 220);
