@@ -29,6 +29,7 @@
 #include <SoftwareSerial.h>
 #include <DFRobotDFPlayerMini.h>
 #include <math.h>
+#include "WDT.h"
 
 /* ================= HARDWARE ================= */
 #define LED_PIN          5
@@ -163,6 +164,7 @@ String stateToString(AlarmState s) {
 
 void stopAudio() {
   dfPlayer.stop();
+  delay(50);
 }
 
 void setVolumeClamped(int vol) {
@@ -172,12 +174,62 @@ void setVolumeClamped(int vol) {
 
 void playTrackLooping(int track) {
   track = constrain(track, 1, 4);
+
+  dfPlayer.stop();
+  delay(80);
+
+  dfPlayer.volume(cfg.volume);
+  delay(50);
+
   dfPlayer.loop(track);
+  delay(80);
+
+  Serial.print("DFPlayer loop command sent for track ");
+  Serial.println(track);
+}
+
+void resetDfPlayerSoft() {
+  Serial.println("Soft resetting DFPlayer...");
+
+  dfPlayer.stop();
+  delay(150);
+
+  dfPlayer.volume(cfg.volume);
+  delay(100);
+
+  Serial.println("DFPlayer soft reset complete.");
 }
 
 void clearLeds() {
   FastLED.clear();
   FastLED.show();
+}
+
+void stopEverything(bool clearSchedule = false) {
+  stopAudio();
+  clearLeds();
+
+  previewLightRunning = false;
+  previewSoundRunning = false;
+
+  currentState = STATE_IDLE;
+  alarmStartEpochSec = 0;
+  snoozeSkipsSunrise = false;
+
+  pendingTakeoverValid = false;
+  pendingTakeoverCfgValid = false;
+  pendingTakeoverId = -1;
+  pendingTakeoverEpochSec = 0;
+
+  if (clearSchedule) {
+    alarmArmed = false;
+    nextAlarmValid = false;
+    nextAlarmId = -1;
+    nextAlarmEpochSec = 0;
+    lastTriggeredAlarmEpochSec = 0;
+  }
+
+  Serial.println("Hardware reset to IDLE.");
 }
 
 void resetAlarmCycleCounters() {
@@ -241,7 +293,7 @@ int xy(int x, int y) {
 
 void getThemeColors(int theme, CRGB &startColor, CRGB &midColor, CRGB &endColor) {
   switch (theme) {
-    case 1: // soft golden morning
+   case 1: // soft golden morning
       startColor = CRGB(40, 10, 0);
       midColor   = CRGB(255, 140, 20);
       endColor   = CRGB(255, 240, 180);
@@ -432,6 +484,17 @@ void handleNextLine(const String &line) {
   unsigned long todayBase = (currentEpochSec / 86400UL) * 86400UL;
   unsigned long candidate = todayBase + (unsigned long)targetSecOfDay;
 
+  // If ESP32 re-sends the same alarm, keep the current armed time.
+  // This prevents the alarm from being rolled forward/skipped.
+  if (incomingId == nextAlarmId && nextAlarmValid && alarmArmed) {
+    unsigned long existingSecOfDay = nextAlarmEpochSec % 86400UL;
+
+    if (existingSecOfDay == (unsigned long)targetSecOfDay) {
+      Serial.println("Duplicate NEXT received. Keeping existing armed alarm.");
+      return;
+    }
+  }
+
   if (candidate <= currentEpochSec) candidate += 86400UL;
 
   nextAlarmEpochSec = candidate;
@@ -533,6 +596,7 @@ void startPreviewSound(int track, int volume, int durationSec) {
   previewTrack = constrain(track, 1, 4);
   previewVolume = constrain(volume, 0, 30);
 
+  resetDfPlayerSoft();
   setVolumeClamped(previewVolume);
   playTrackLooping(previewTrack);
   currentState = STATE_PREVIEW;
@@ -590,7 +654,9 @@ void handleIncomingLine(String line) {
   } else if (line.startsWith("PREVIEW,")) {
     handlePreviewLine(line);
   } else if (line.startsWith("PREVIEW_STOP")) {
-    stopPreview();
+  stopPreview();
+  } else if (line.startsWith("STOP") || line.startsWith("RESET_STATE")) {
+    stopEverything(false);
   }
 }
 
@@ -902,6 +968,22 @@ void sendStatus() {
   Serial.println(msg);
 }
 
+void safetyRecoverIfStuck() {
+  // If preview somehow lasts too long, stop it.
+  if (currentState == STATE_PREVIEW &&
+      (millis() - previewStartMs > previewDurationMs + 5000UL)) {
+    Serial.println("Safety recovery: preview exceeded expected duration.");
+    stopEverything(false);
+  }
+
+  // If alarm state has no valid schedule, return to idle safely.
+  if ((currentState == STATE_SUNRISE || currentState == STATE_ALARM || currentState == STATE_SNOOZED) &&
+      (!timeValid || !nextAlarmValid || nextAlarmId < 0 || !alarmArmed)) {
+    Serial.println("Safety recovery: active state without valid alarm schedule.");
+    stopEverything(false);
+  }
+}
+
 /* ===================================================== */
 /* ============== OPTIONAL USB TEST COMMANDS =========== */
 /* ===================================================== */
@@ -958,6 +1040,16 @@ void setup() {
   Serial.begin(SERIAL_BAUD_USB);
   Serial1.begin(SERIAL_BAUD_LINK);
 
+  Serial.setTimeout(50);
+  Serial1.setTimeout(50);
+
+  if (WDT.begin(5000)) {
+    WDT.refresh();
+    Serial.println("Watchdog enabled.");
+  } else {
+    Serial.println("Watchdog failed to start.");
+  }
+
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
@@ -985,5 +1077,8 @@ void loop() {
   handleUsbCommands();
   handleButton();
   runAlarmStateMachine();
+  safetyRecoverIfStuck();
   sendStatus();
+
+  WDT.refresh();
 }
